@@ -93,6 +93,15 @@ function connect() {
     console.log(`🔌 WebSocket closed (code: ${event.code})`);
     STATE.authenticated = false;
     STATE.agentOnline = false;
+    // Reset streaming state on disconnect — otherwise UI gets stuck
+    if (STATE.streaming) {
+      STATE.streaming = false;
+      updateSendButton();
+      // Remove any lingering streaming cursors
+      document.querySelectorAll('.streaming-cursor').forEach(el => {
+        el.classList.remove('streaming-cursor');
+      });
+    }
     updateAgentStatus();
     scheduleReconnect();
   };
@@ -486,6 +495,27 @@ messageInput.addEventListener('input', () => {
 sendBtn.addEventListener('click', sendMessage);
 
 newSessionBtn.addEventListener('click', newSession);
+
+// ── Streaming Watchdog ─────────────────────────────────────────
+// If streaming state is stuck for > 2 minutes, auto-reset
+let streamingWatchdog = null;
+const origSendMessage = sendMessage;
+sendMessage = function() {
+  // Reset watchdog on each send
+  if (streamingWatchdog) clearTimeout(streamingWatchdog);
+  streamingWatchdog = setTimeout(() => {
+    if (STATE.streaming) {
+      console.warn('⚠ Streaming watchdog triggered — resetting stuck state');
+      STATE.streaming = false;
+      updateSendButton();
+      document.querySelectorAll('.streaming-cursor').forEach(el => {
+        el.classList.remove('streaming-cursor');
+      });
+      addSystemMessage('⚠ 响应超时，请重试');
+    }
+  }, 120000);
+  return origSendMessage();
+};
 
 // ── Heartbeat ──────────────────────────────────────────────────
 setInterval(() => {

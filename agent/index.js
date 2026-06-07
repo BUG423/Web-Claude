@@ -175,106 +175,102 @@ function runClaudeProcess(sessionId, message) {
     '--session-id', sessionId,        // maintain conversation state
   ];
 
-  console.log(`   🚀 Starting: claude ${args.join(' ')}`);
+  console.log(`   🚀 [${new Date().toLocaleTimeString()}] Starting: claude ${args.join(' ')}`);
 
   const proc = spawn('claude', args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env },
-    // No shell — spawn claude directly
   });
 
   activeProcesses.get(sessionId).proc = proc;
 
   let buffer = '';
+  let closed = false;  // Guard against double-close (error + close both fire)
+
+  function finalize(exitCode, isError, errorMsg) {
+    // Prevent double-processing: error + close both fire for the same process
+    if (closed) return;
+    closed = true;
+
+    clearTimeout(timeout);
+
+    // Process remaining buffer
+    if (buffer.trim()) {
+      try {
+        const event = JSON.parse(buffer);
+        send({ type: 'stream', sessionId, event });
+      } catch { /* ignore */ }
+    }
+
+    if (isError) {
+      console.error(`   ❌ [${new Date().toLocaleTimeString()}] Process error: ${errorMsg}`);
+    } else {
+      console.log(`   ✅ [${new Date().toLocaleTimeString()}] Process exited (code: ${exitCode}) for session ${sessionId.slice(0, 8)}`);
+    }
+
+    // Notify browsers that streaming is done
+    send({
+      type: 'status',
+      sessionId,
+      status: isError ? 'error' : 'done',
+      exitCode: exitCode,
+      message: isError ? errorMsg : undefined
+    });
+
+    // Clean up process reference and process next queued message
+    const session = activeProcesses.get(sessionId);
+    if (session) {
+      session.proc = null;
+      if (session.queue.length > 0) {
+        const next = session.queue.shift();
+        console.log(`   ▶ [${new Date().toLocaleTimeString()}] Processing queued message for session ${sessionId.slice(0, 8)}`);
+        // Use setImmediate to avoid deep recursion if many queued messages
+        setImmediate(() => runClaudeProcess(sessionId, next.message));
+        return;
+      }
+    }
+  }
 
   proc.stdout.on('data', (chunk) => {
     buffer += chunk.toString();
     const lines = buffer.split('\n');
-    // Keep the last incomplete line in the buffer
     buffer = lines.pop() || '';
 
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        send({
-          type: 'stream',
-          sessionId,
-          event
-        });
+        send({ type: 'stream', sessionId, event });
       } catch {
-        // Non-JSON line (e.g., raw text), skip or log
         console.warn(`   ⚠  Non-JSON output: ${line.slice(0, 100)}`);
       }
     }
   });
 
   proc.stderr.on('data', (chunk) => {
-    console.error(`   ❌ stderr: ${chunk.toString().trim()}`);
+    console.error(`   📝 stderr: ${chunk.toString().trim()}`);
   });
 
   proc.on('close', (code) => {
-    // Process remaining buffer
-    if (buffer.trim()) {
-      try {
-        const event = JSON.parse(buffer);
-        send({
-          type: 'stream',
-          sessionId,
-          event
-        });
-      } catch { /* ignore */ }
-    }
-
-    console.log(`   ✅ Process exited (code: ${code}) for session ${sessionId.slice(0, 8)}`);
-
-    // Notify browsers that streaming is done
-    send({
-      type: 'status',
-      sessionId,
-      status: 'done',
-      exitCode: code
-    });
-
-    // Clean up process reference
-    const session = activeProcesses.get(sessionId);
-    if (session) {
-      session.proc = null;
-
-      // Process next queued message, if any
-      if (session.queue.length > 0) {
-        const next = session.queue.shift();
-        console.log(`   ▶  Processing queued message for session ${sessionId.slice(0, 8)}`);
-        runClaudeProcess(sessionId, next.message);
-      }
-    }
+    finalize(code, false, null);
   });
 
   proc.on('error', (err) => {
-    console.error(`   ❌ Failed to start Claude process: ${err.message}`);
-
-    send({
-      type: 'status',
-      sessionId,
-      status: 'error',
-      message: `Failed to start Claude: ${err.message}`
-    });
-
-    // Clean up
-    const session = activeProcesses.get(sessionId);
-    if (session) {
-      session.proc = null;
-      // Process next queued message
-      if (session.queue.length > 0) {
-        const next = session.queue.shift();
-        runClaudeProcess(sessionId, next.message);
-      }
-    }
+    finalize(-1, true, `Failed to start Claude: ${err.message}`);
   });
 
-  // Write the message to stdin
-  proc.stdin.write(message);
+  // Write the message to stdin with error handling
+  proc.stdin.on('error', (err) => {
+    console.error(`   ❌ stdin error: ${err.message}`);
+    // If stdin fails, the process will exit on its own → close handler fires
+  });
+
+  const written = proc.stdin.write(message + '\n');
   proc.stdin.end();
+
+  if (!written) {
+    console.warn(`   ⚠  stdin buffer full, waiting for drain...`);
+  }
 
   // Set a timeout (5 minutes)
   const timeout = setTimeout(() => {
@@ -286,8 +282,6 @@ function runClaudeProcess(sessionId, message) {
       }, 5000);
     }
   }, 5 * 60 * 1000);
-
-  proc.on('close', () => clearTimeout(timeout));
 }
 
 // ─── Heartbeat ───────────────────────────────────────────────────
