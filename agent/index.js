@@ -187,9 +187,10 @@ function runClaudeProcess(sessionId, message) {
   });
 
   const args = [
-    '-p',                             // --print mode
-    '--verbose',                       // required for stream-json output
-    '--output-format', 'stream-json', // streaming JSON output
+    '-p',
+    '--verbose',
+    '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',   // 跳过所有权限确认
   ];
 
   // Build conversation context from history
