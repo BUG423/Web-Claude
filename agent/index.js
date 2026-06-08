@@ -86,8 +86,16 @@ function connect() {
 
   ws.on('close', (code) => {
     console.log(`🔌 与服务器断开 (code: ${code})`);
-    // 终端进程保持存活（用户重连后可继续），仅标记聊天进程清理
     ws = null;
+    // code 4000 = 服务器端 "New agent connected"：已有另一个 Agent 接管。
+    // 若此时自动重连，会和对方互相踢下线形成每秒乒乓循环，导致会话错乱。
+    // 因此被踢的 Agent 停止重连、进入空闲，确保全局只有一个活跃 Agent。
+    if (code === 4000) {
+      console.warn('⚠  另一个 Agent 已接管服务器连接（code 4000）。');
+      console.warn('⚠  本 Agent 停止自动重连并进入空闲，避免两个 Agent 互相抢占。');
+      console.warn('⚠  请确认只运行一个 Agent；如需本机接管，请先停止另一个 Agent 再重启本进程。');
+      return;
+    }
     scheduleReconnect();
   });
 
@@ -118,6 +126,35 @@ function send(data) {
 /** 向服务器上报完整会话列表 */
 function reportSessions() {
   send({ type: 'sessions', sessions: sessionManager.listSessions() });
+}
+
+// ─── 终端输出批处理 ─────────────────────────────────────────────
+// PTY 常在极短时间内产生大量小数据块（如 shell 启动横幅 fortune|cowsay|lolcat
+// 会逐字符发送上百条彩色转义序列）。逐块走 WS 会放大延迟与卡顿。
+// 这里按 ~12ms 窗口合并成一条消息发送，保持流畅手感的同时大幅减少消息数。
+const outBuffers = new Map(); // sessionId -> { data, timer }
+const OUT_FLUSH_MS = 12;
+const OUT_MAX_BYTES = 64 * 1024;
+
+function queueOutput(sessionId, chunk) {
+  let b = outBuffers.get(sessionId);
+  if (!b) { b = { data: '', timer: null }; outBuffers.set(sessionId, b); }
+  b.data += chunk;
+  if (Buffer.byteLength(b.data) >= OUT_MAX_BYTES) { flushOutput(sessionId); return; }
+  if (!b.timer) b.timer = setTimeout(() => flushOutput(sessionId), OUT_FLUSH_MS);
+}
+
+function flushOutput(sessionId) {
+  const b = outBuffers.get(sessionId);
+  if (!b) return;
+  if (b.timer) { clearTimeout(b.timer); b.timer = null; }
+  if (b.data) { send({ type: 'terminal_output', sessionId, data: b.data }); b.data = ''; }
+}
+
+function dropOutputBuffer(sessionId) {
+  const b = outBuffers.get(sessionId);
+  if (b && b.timer) clearTimeout(b.timer);
+  outBuffers.delete(sessionId);
 }
 
 // ─── 消息处理 ───────────────────────────────────────────────────
@@ -153,6 +190,7 @@ function handleMessage(data) {
 
     // ── 终端：删除 ────────────────────────────────────────────
     case 'terminal_delete': {
+      dropOutputBuffer(data.sessionId);
       sessionManager.deleteSession(data.sessionId, !!data.deleteFiles);
       send({ type: 'terminal_closed', sessionId: data.sessionId });
       reportSessions();
@@ -191,8 +229,9 @@ function onTerminalCreate(data) {
 
   try {
     const session = sessionManager.createSession(sessionId, title || '新会话', {
-      onData: (sid, chunk) => send({ type: 'terminal_output', sessionId: sid, data: chunk }),
+      onData: (sid, chunk) => queueOutput(sid, chunk),
       onExit: (sid, evt) => {
+        flushOutput(sid); // 先把残留输出发完
         send({ type: 'terminal_exit', sessionId: sid, exitCode: evt.exitCode, signal: evt.signal });
         reportSessions();
       },
